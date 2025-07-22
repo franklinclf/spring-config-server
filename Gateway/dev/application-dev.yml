@@ -1,0 +1,243 @@
+spring:
+  data:
+    redis:
+      host: redis
+      port: 6379
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+          max-wait: -1ms
+    cloud:
+      gateway:
+        server:
+          cache:
+            type: caffeine
+            caffeine:
+              spec: maximumSize=10000,expireAfterWrite=60s
+            cache-names:
+              - rateLimitCache
+              - responseCache
+          httpclient:
+            pool:
+              type: elastic
+              max-connections: 1000
+              max-life-time: 60s
+              max-idle-time: 20s
+              eviction-interval: 30s
+            connect-timeout: 5000
+            response-timeout: 30s
+            globalcors:
+              cors-configurations:
+                '[/**]':
+                  allowed-origins: "*"
+                  allowed-methods: "*"
+                  allowed-headers: "*"
+                  allow-credentials: false
+          webflux:
+            - id: nexus
+              uri: lb://NEXUS
+              predicates:
+                - Path=/nexus/**
+              filters:
+                - StripPrefix=1
+                - name: CircuitBreaker
+                  args:
+                    name: nexusCircuitBreaker
+                    fallbackUri: forward:/fallback/nexus
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter:
+                      replenishRate: 100
+                      burstCapacity: 200
+                      requestedTokens: 1
+                    key-resolver: "#{@userKeyResolver}"
+                - name: Retry
+                  args:
+                    retries: 5
+                    statuses: BAD_GATEWAY, GATEWAY_TIMEOUT, SERVICE_UNAVAILABLE
+                    methods: GET, POST, PUT, DELETE, PATCH
+                    backoff:
+                      firstBackoff: 300ms
+                      maxBackoff: 1200ms
+                      factor: 2
+                      basedOnPreviousValue: false
+
+            - id: ai
+              uri: lb://AI
+              predicates:
+                - Path=/ai/**
+              filters:
+                - StripPrefix=1
+                - name: CircuitBreaker
+                  args:
+                    name: aiCircuitBreaker
+                    fallbackUri: forward:/fallback/ai
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter:
+                      replenishRate: 20
+                      burstCapacity: 50
+                      requestedTokens: 1
+                    key-resolver: "#{@userKeyResolver}"
+                - name: Retry
+                  args:
+                    retries: 3
+                    statuses: BAD_GATEWAY, GATEWAY_TIMEOUT
+                    methods: POST, GET, PATCH, PUT, DELETE
+                    backoff:
+                      firstBackoff: 500ms
+                      maxBackoff: 5000ms
+                      factor: 2
+                      basedOnPreviousValue: false
+
+            - id: tools
+              uri: lb://MCP
+              predicates:
+                - Path=/tools/**
+              filters:
+                - StripPrefix=1
+                - name: CircuitBreaker
+                  args:
+                    name: toolsCircuitBreaker
+                    fallbackUri: forward:/fallback/tools
+                - name: Retry
+                  args:
+                    retries: 10
+                    statuses: BAD_GATEWAY, GATEWAY_TIMEOUT, SERVICE_UNAVAILABLE
+                    methods: GET, POST, PUT, DELETE, PATCH
+                    backoff:
+                      firstBackoff: 10s
+                      maxBackoff: 40s
+                      factor: 2
+                      basedOnPreviousValue: false
+
+            - id: health
+              uri: no://op
+              predicates:
+                - Path=/health/**
+              filters:
+                - SetStatus=200
+                - SetResponseHeader=Content-Type, application/json
+                - SetPath=/actuator/health
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 20
+        sliding-window-type: COUNT_BASED
+        minimum-number-of-calls: 10
+        permitted-number-of-calls-in-half-open-state: 5
+        wait-duration-in-open-state: 10s
+        failure-rate-threshold: 50
+        slow-call-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+        record-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+          - org.springframework.web.reactive.function.client.WebClientResponseException$ServiceUnavailable
+          - org.springframework.web.reactive.function.client.WebClientResponseException$BadGateway
+          - org.springframework.web.reactive.function.client.WebClientResponseException$GatewayTimeout
+    instances:
+      nexusCircuitBreaker:
+        base-config: default
+        wait-duration-in-open-state: 10s
+        failure-rate-threshold: 40
+        sliding-window-size: 15
+        minimum-number-of-calls: 5
+        permitted-number-of-calls-in-half-open-state: 5
+      aiCircuitBreaker:
+        base-config: default
+        sliding-window-size: 10
+        wait-duration-in-open-state: 30s
+        slow-call-duration-threshold: 10s
+        failure-rate-threshold: 30
+      toolsCircuitBreaker:
+        base-config: default
+        wait-duration-in-open-state: 15s
+        slow-call-duration-threshold: 5s
+
+  bulkhead:
+    configs:
+      default:
+        max-concurrent-calls: 100
+        max-wait-duration: 1s
+    instances:
+      nexusBulkhead:
+        base-config: default
+        max-concurrent-calls: 50
+      aiBulkhead:
+        max-concurrent-calls: 10
+        max-wait-duration: 10s
+      toolsBulkhead:
+        base-config: default
+        max-concurrent-calls: 30
+
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 30s
+        cancel-running-future: true
+    instances:
+      nexusTimeLimiter:
+        base-config: default
+        timeout-duration: 10s
+      aiTimeLimiter:
+        timeout-duration: 60s
+        cancel-running-future: false
+      toolsTimeLimiter:
+        base-config: default
+        timeout-duration: 20s
+
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "*"
+      discovery:
+        enabled: true
+    access:
+      default: unrestricted
+  endpoint:
+    metrics:
+      access: unrestricted
+    prometheus:
+      access: unrestricted
+    health:
+      show-details: always
+      show-components: always
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}-${REPLICA_ID:1}
+    distribution:
+      percentiles-histogram:
+        enabled: true
+        http.server.requests: true
+        http.client.requests: true
+        resilience4j.circuitbreaker.calls: true
+    enable:
+      jvm: true
+      process: true
+      system: true
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://zipkin:9411/api/v2/spans
+  logging:
+    export:
+      enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+        step: 5s
